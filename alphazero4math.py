@@ -22,7 +22,7 @@ from peft import get_peft_model, LoraConfig
 import contextlib
 import accelerate
 
-accelerator = accelerate.Accelerator()
+accelerator = accelerate.Accelerator(gradient_accumulation_steps=64)
 accelerator.device
 
 @contextlib.contextmanager
@@ -45,14 +45,14 @@ def set_left_padding(tokenizer):
 model_name = "/mnt/hwfile/ai4chem/CKPT/longcot_pt_GEMMA_ZD_10_23_1"
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 model = AutoModelForCausalLM.from_pretrained(
-    model_name, device_map="auto", torch_dtype=torch.bfloat16, use_cache=True
+    model_name, torch_dtype=torch.bfloat16
 )
 
 # 设置 LoRA 配置
 lora_config = LoraConfig(
     r=8,  # 低秩矩阵的秩
     lora_alpha=16,  # LoRA 的缩放系数
-    target_modules=["q_proj", "v_proj"],  # 目标模块，通常是查询和键的投影层
+    target_modules=["k_proj","q_proj","o_proj", "v_proj","down_proj","gate_proj","up_proj",],  # 目标模块，通常是查询和键的投影层
     lora_dropout=0.1,  # dropout 概率
     bias="none",  # 不在 LoRA 中包含偏置
 )
@@ -68,7 +68,7 @@ meta_action_types_weight = [0.2, 0.4, 0.4, 0.3]
 
 GT = f"#### 23"
 
-hint = f'<hint> Try generate a reasonable rationale solution that can got final answer </hint>'
+hint = f'<hint> Try generate a reasonable rationale solution that can got final answer {GT}</hint>'
 # hint = ''
 
 
@@ -84,172 +84,6 @@ GENERATE_MAX_NEW_TOKENS = 256
 CUT_OFF_LEN = 1024
 
 import torch
-
-
-def chunked_forward_with_attention_sink(
-    model,
-    tokenizer,
-    text,
-    chunk_size=256,
-    attention_window=512,
-):
-    torch.cuda.empty_cache()  # 清空显存
-    # 初始化输入和设置设备
-    with set_left_padding(tokenizer):
-        inputs = tokenizer(
-            text,
-            return_tensors="pt",
-            padding="longest",  # Enable padding
-            pad_to_multiple_of=chunk_size,  # Pad to nearest multiple of chunk_size
-        )
-    inputs = {k: v.to(accelerator.device) for k, v in inputs.items()}
-    input_ids = inputs["input_ids"]
-    attention_mask = inputs["attention_mask"]
-
-    # 将输入序列分块
-    input_chunks = torch.split(input_ids, chunk_size, dim=1)
-    mask_chunks = torch.split(attention_mask, chunk_size, dim=1)
-
-    # 初始化生成的文本和past_key_values（注意力缓存）
-    past_key_values = None
-    logits_outputs = []
-
-    # Step 1: 分块进行 forward 操作，更新past_key_values
-    for i, (input_chunk, mask_chunk) in enumerate(zip(input_chunks, mask_chunks)):
-        # print(i, input_ids.shape[1],input_chunk.shape)
-        chunk_inputs = {
-            "input_ids": input_chunk,
-            "attention_mask": mask_chunk,
-            "past_key_values": past_key_values,
-        }
-        outputs = model(**chunk_inputs, use_cache=True, return_dict=True)
-        past_key_values = outputs.past_key_values  # 更新past_key_values
-        logits_outputs.append(outputs.logits)
-
-    # 合并所有子块的 logits
-    final_logits = torch.cat(logits_outputs, dim=1)
-    return final_logits
-
-
-def chunked_generate_with_attention_sink(
-    model,
-    tokenizer,
-    text,
-    chunk_size=256,
-    max_new_tokens=1024,
-    attention_window=512,
-    device="cuda",
-    stop_strings=None,
-    temperature=0.8,
-):
-    """
-    分块生成文本，并通过Attention Sink在有限内存环境中进行高效流式生成。
-
-    参数：
-    - model: 预训练的Hugging Face模型
-    - tokenizer: Hugging Face的分词器
-    - text: 输入文本（str）
-    - chunk_size: 每个分块的长度（默认为256）
-    - max_new_tokens: 最大生成长度
-    - attention_window: 最大注意力窗口；超出该长度的token会被丢弃
-    - device: 设备（默认为"cuda"）
-
-    返回：
-    - generated_text: 完整的生成文本
-    """
-    max_new_tokens = (
-        max_new_tokens // chunk_size * chunk_size
-    )  # Ensure max_new_tokens is a multiple of chunk_size
-    end_token_ids = [tokenizer.convert_tokens_to_ids(token) for token in stop_strings]
-    torch.cuda.empty_cache()  # 清空显存
-    # 初始化输入和设置设备
-    with set_left_padding(tokenizer):
-        inputs = tokenizer(
-            text,
-            return_tensors="pt",
-            padding="longest",  # Enable padding
-            pad_to_multiple_of=chunk_size,  # Pad to nearest multiple of chunk_size
-        )
-    inputs = {k: v.to(accelerator.device) for k, v in inputs.items()}
-    input_ids = inputs["input_ids"]
-    attention_mask = inputs["attention_mask"]
-
-    # 将输入序列分块
-    input_chunks = torch.split(input_ids, chunk_size, dim=1)
-    mask_chunks = torch.split(attention_mask, chunk_size, dim=1)
-
-    # 初始化生成的文本和past_key_values（注意力缓存）
-    past_key_values = None
-    generated_text = text
-    stacked_input_ids = []
-    stacked_logits = []
-
-    with torch.no_grad():
-        # Step 1: 分块进行 forward 操作，更新past_key_values
-        for i, (input_chunk, mask_chunk) in enumerate(
-            zip(input_chunks[:-1], mask_chunks[:-1])
-        ):
-            # print(i, input_ids.shape[1],input_chunk.shape)
-            chunk_inputs = {
-                "input_ids": input_chunk,
-                "attention_mask": mask_chunk,
-                "past_key_values": past_key_values,
-            }
-            outputs = model(**chunk_inputs, use_cache=True)
-            past_key_values = outputs.past_key_values  # 更新past_key_values
-
-        input_chunk = input_chunks[-1]
-        mask_chunk = mask_chunks[-1]
-        # Step 2: 分块生成新token
-        for _ in range(0, max_new_tokens, chunk_size):
-            gen_inputs = {
-                "input_ids": input_chunk,
-                "attention_mask": mask_chunk,
-                "past_key_values": past_key_values,
-            }
-            outputs = model.generate(
-                **gen_inputs,
-                max_new_tokens=chunk_size,
-                use_cache=True,
-                stop_strings=stop_strings,
-                tokenizer=tokenizer,
-                output_logits=True,
-                return_dict_in_generate=True,
-                cache_implementation=None,
-                do_sample=True,
-                temperature=temperature,
-            )
-            gen_ids = outputs.sequences
-            logits = outputs.logits
-
-            if isinstance(outputs.logits, tuple):
-                logits = torch.stack(outputs.logits, dim=0)
-            else:
-                logits = outputs.logits  # If already a tensor
-            stacked_logits.append(logits)
-            # 将生成的内容拼接到总结果中
-            stacked_input_ids.append(gen_ids[:, -logits.shape[0] :])
-            input_chunk = gen_ids
-            mask_chunk = torch.ones_like(input_ids)
-            # print(input_chunk.shape)
-            # 如果生成到达停止标记或到达最大生成长度则停止
-            if logits.shape[0] < chunk_size:
-                break
-
-            # 更新past_key_values
-            past_key_values = outputs.past_key_values
-            # print(outputs.past_key_values)
-
-        # 整合所有生成的id和logits
-        final_output_ids = torch.cat(stacked_input_ids, dim=1)
-        final_logits = torch.cat(stacked_logits, dim=0) if stacked_logits else None
-
-    return (
-        tokenizer.decode(final_output_ids[0], skip_special_tokens=False),
-        final_output_ids,
-        final_logits,
-    )
-
 
 # Tree Node Structure
 class TreeNode:
@@ -501,66 +335,35 @@ def compute_policy_head(selected_node, num_candidates=3, meta=""):
             selected_node, get_max_node_id_in_tree(selected_node) + 1, '',hint 
         )
 
-    if len(inputs_string) > CHUNCKED_INFERENCE_LENGTH and False:
+    with set_left_padding(tokenizer):
+        inputs = tokenizer(inputs_string, return_tensors="pt", truncation=True, padding=True, max_length=CUT_OFF_LEN)
+    inputs = {k: v.to(accelerator.device) for k, v in inputs.items()}
+    outputs = accelerator.unwrap_model(model).generate(
+        **inputs,
+        max_new_tokens=GENERATE_MAX_NEW_TOKENS,
+        do_sample=True,
+        num_return_sequences=num_candidates,
+        output_logits=True,
+        return_dict_in_generate=True,
+        stop_strings=policy_head_stopping_criteria,
+        tokenizer=tokenizer,
+    )
 
-        generated_texts = []
-        log_probs_list = []
-        entropy_list = []
-        varentropy_list = []
-        for i in range(num_candidates):
-            generated_text, output_ids, logits = chunked_generate_with_attention_sink(
-                model,
-                tokenizer,
-                inputs_string,
-                chunk_size=CHUNCKED_INFERENCE_LENGTH,
-                stop_strings=policy_head_stopping_criteria,
-                max_new_tokens=GENERATE_MAX_NEW_TOKENS,
-            )
-            # print(generated_text, output_ids.shape, logits.shape)
-            generated_texts.append(generated_text)
+    # Extract generated sequences and scores
+    output_ids = outputs.sequences
 
-            normalized_log_probs, normalized_entropy, varentropy = (
-                length_normed_log_probs(output_ids[:, -logits.shape[0] :], logits)
-            )
-            # print(normalized_log_probs.shape, normalized_entropy.shape, varentropy.shape)
-            log_probs_list.append(normalized_log_probs.item())
-            entropy_list.append(normalized_entropy.item())
-            varentropy_list.append(varentropy.item())
-        normalized_log_probs, normalized_entropy, varentropy = (
-            torch.tensor(log_probs_list),
-            torch.tensor(entropy_list),
-            torch.tensor(varentropy_list),
-        )
+    if isinstance(outputs.logits, tuple):
+        logits = torch.stack(outputs.logits, dim=0)
     else:
-        with set_left_padding(tokenizer):
-            inputs = tokenizer(inputs_string, return_tensors="pt", truncation=True, padding=True, max_length=CUT_OFF_LEN)
-        inputs = {k: v.to(accelerator.device) for k, v in inputs.items()}
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=GENERATE_MAX_NEW_TOKENS,
-            do_sample=True,
-            num_return_sequences=num_candidates,
-            output_logits=True,
-            return_dict_in_generate=True,
-            stop_strings=policy_head_stopping_criteria,
-            tokenizer=tokenizer,
-        )
+        logits = outputs.logits  # If already a tensor
 
-        # Extract generated sequences and scores
-        output_ids = outputs.sequences
+    generated_texts = tokenizer.batch_decode(
+        output_ids[:, -logits.shape[0] :], skip_special_tokens=False
+    )
 
-        if isinstance(outputs.logits, tuple):
-            logits = torch.stack(outputs.logits, dim=0)
-        else:
-            logits = outputs.logits  # If already a tensor
-
-        generated_texts = tokenizer.batch_decode(
-            output_ids[:, -logits.shape[0] :], skip_special_tokens=False
-        )
-
-        normalized_log_probs, normalized_entropy, varentropy = length_normed_log_probs(
-            output_ids[:, -logits.shape[0] :], logits
-        )
+    normalized_log_probs, normalized_entropy, varentropy = length_normed_log_probs(
+        output_ids[:, -logits.shape[0] :], logits
+    )
 
     generated_texts = [meta + clean_generated_text(text) for text in generated_texts]
 
@@ -592,41 +395,17 @@ def compute_policy_head(selected_node, num_candidates=3, meta=""):
 
 
 @torch.no_grad()
-def compute_value_head(selected_node):
+def compute_value_head(node):
     # 将state传入tokenizer并获取模型输入
-    inputs_string = value_head_template(selected_node)
-    if len(inputs_string) > CHUNCKED_INFERENCE_LENGTH and False:
-        logits = chunked_forward_with_attention_sink(
-            model, tokenizer, inputs_string, chunk_size=CHUNCKED_INFERENCE_LENGTH
-        )
-        last_second_logits = logits[:, -1, :]  # 倒数第二个位置的logit
-    else:
-        with set_left_padding(tokenizer):
-            inputs = tokenizer(inputs_string, return_tensors="pt", truncation=True, padding=True, max_length=CUT_OFF_LEN)
-        inputs = {k: v.to(accelerator.device) for k, v in inputs.items()}
-        # 使用模型生成outputs
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=2,
-            # do_sample=True,
-            # num_return_sequences=1,
-            output_logits=True,
-            return_dict_in_generate=True,
-            stop_strings=value_head_stopping_criteria,
-            tokenizer=tokenizer,
-        )
+    text_for_value = value_head_template(node) + '<positive_rating>'
+    with set_left_padding(tokenizer):
+        inputs = tokenizer(text_for_value, return_tensors="pt", truncation=True, padding=True, max_length=CUT_OFF_LEN)
+    inputs = {k: v.to(accelerator.device) for k, v in inputs.items()}
+    outputs = model(**inputs, return_dict=True)
+    logits = outputs.logits
 
-        # 提取logits
-        if isinstance(outputs.logits, tuple):
-            logits = torch.stack(outputs.logits, dim=0)
-        else:
-            logits = outputs.logits  # 如果 logits 已是张量
 
-        # 定位倒数第二个位置的logit
-        if logits.size(0) < 1:
-            raise ValueError("生成序列太短，无法提取倒数第二个位置的logit。")
-
-        last_second_logits = logits[-1, :, :]  # 倒数第二个位置的logit
+    last_second_logits = logits[:, -1, :]  # 倒数第一个位置的logit
 
     # 获取 "<positive_rating>" 和 "<negative_rating>" 的token ID
     positive_token_id = tokenizer.convert_tokens_to_ids("<positive_rating>")
@@ -802,15 +581,11 @@ class MCTS:
 def training_time_policy_predict(node, model):
     # Use the model to predict the value of the current state
     text_for_policy = policy_head_template(node.parent, node.index) + node.state
-    if len(text_for_policy) > CHUNCKED_INFERENCE_LENGTH and False:
-        logits = chunked_forward_with_attention_sink(
-            model, tokenizer, text_for_policy, chunk_size=CHUNCKED_INFERENCE_LENGTH
-        )
-    else:
-        inputs = tokenizer(text_for_policy, return_tensors="pt")
-        inputs = {k: v.to(accelerator.device) for k, v in inputs.items()}
-        outputs = model(**inputs, return_dict=True)
-        logits = outputs.logits
+    with set_left_padding(tokenizer):
+        inputs = tokenizer(text_for_policy, return_tensors="pt", truncation=True, padding=True, max_length=CUT_OFF_LEN)
+    inputs = {k: v.to(accelerator.device) for k, v in inputs.items()}
+    outputs = model(**inputs, return_dict=True)
+    logits = outputs.logits
 
     target = tokenizer(node.state, return_tensors="pt")
     target = {k: v.to(accelerator.device) for k, v in target.items()}
@@ -825,16 +600,11 @@ def training_time_policy_predict(node, model):
 @lru_cache(maxsize=1000)
 def training_time_value_predict(node):
     text_for_value = value_head_template(node) + value_to_rating_token(node.value)
-
-    if len(text_for_value) > CHUNCKED_INFERENCE_LENGTH and False:
-        logits = chunked_forward_with_attention_sink(
-            model, tokenizer, text_for_value, chunk_size=CHUNCKED_INFERENCE_LENGTH
-        )
-    else:
-        inputs = tokenizer(text_for_value, return_tensors="pt")
-        inputs = {k: v.to(accelerator.device) for k, v in inputs.items()}
-        outputs = model(**inputs, return_dict=True)
-        logits = outputs.logits
+    with set_left_padding(tokenizer):
+        inputs = tokenizer(text_for_value, return_tensors="pt", truncation=True, padding=True, max_length=CUT_OFF_LEN)
+    inputs = {k: v.to(accelerator.device) for k, v in inputs.items()}
+    outputs = model(**inputs, return_dict=True)
+    logits = outputs.logits
 
     last_second_logits = logits[:, -1, :]  # 倒数第一个位置的logit
 
@@ -1020,7 +790,7 @@ def train_model_with_ppo_gae(
             with torch.no_grad():
                 old_policy_probs = torch.tensor(
                     [
-                        training_time_policy_predict(child, model.get_base_model())[0]
+                        training_time_policy_predict(child, accelerator.unwrap_model(model).get_base_model())[0]
                         for child in node.children
                     ],
                     dtype=torch.float32,
@@ -1066,13 +836,13 @@ def train_model_with_ppo_gae(
 
             # 每处理完一个节点后检查是否达到累积步骤
             step_count += 1
-            total_loss = (policy_loss + value_loss) / accumulation_steps
+            total_loss = policy_loss + value_loss #/ accumulation_steps
             print(policy_loss.item(), value_loss.item(), total_loss.item())
-            total_loss.backward()
-            if step_count % accumulation_steps == 0:
-                # 累积足够的梯度后，进行一次参数更新
-                optimizer.step()
-                optimizer.zero_grad()
+            accelerator.backward(total_loss)
+
+            # 累积足够的梯度后，进行一次参数更新
+            optimizer.step()
+            optimizer.zero_grad()
             policy_loss_list.append(policy_loss.item())
             value_loss_list.append(value_loss.item())
             total_loss_list.append(total_loss.item())
@@ -1080,20 +850,16 @@ def train_model_with_ppo_gae(
             value_loss = 0
             total_loss = 0
 
-    # 确保所有梯度都被处理，处理不完整批次的梯度
-    if step_count % accumulation_steps != 0 and step_count > 0:
-        optimizer.step()
-        optimizer.zero_grad()
-
     return np.mean(policy_loss_list), np.mean(value_loss_list), np.mean(total_loss_list)
 
 
 # Self-play and Training Loop
 class AlphaGoZeroForMath:
-    def __init__(self, model, tokenizer):
+    def __init__(self, model, tokenizer,optimizer):
         self.model = model
         self.tokenizer = tokenizer
         self.mcts = MCTS(model, tokenizer)
+        self.optimizer = optimizer
 
     def self_play(self, initial_state):
         root_node = TreeNode(state=initial_state)
@@ -1107,15 +873,21 @@ class AlphaGoZeroForMath:
             self.update_model(root_node)
 
     def update_model(self, root_node):
-        loss = train_model_with_ppo_gae(root_node, optimizer)
+        loss = train_model_with_ppo_gae(root_node, self.optimizer)
         print(f"Training Loss: {loss}")
 
+from datasets import load_dataset
+
+# gsm8k = load_dataset("gsm8k",subset='train')
+# dataloader = torch.utils.data.DataLoader(gsm8k, batch_size=1, shuffle=True)
+
+model, tokenizer, optimizer = accelerator.prepare(model, tokenizer, optimizer)
 
 # Running Training
 initial_state = problem_declaration_template(
     "There are several chickens and rabbits in a cage. Counting from the top, there are 35 heads and counting from the bottom, there are 94 feet. How many chickens are there?"
 )
-agent = AlphaGoZeroForMath(model, tokenizer)
+agent = AlphaGoZeroForMath(model, tokenizer, optimizer)
 agent.train(num_iterations=10, initial_state=initial_state)
 
 
