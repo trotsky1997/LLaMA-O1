@@ -1,33 +1,254 @@
 # Imports and Model Initialization
-from email import policy
+import copy
+from functools import lru_cache
+import math
 import random
-from anyio import value
-from transformers import AutoModelForCausalLM, AutoTokenizer
+import re
+from tqdm import tqdm
+from transformers import AutoModelForCausalLM, AutoTokenizer, SinkCache
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
 import numpy as np
+from torch.nn.utils.rnn import pad_sequence
 
 from transformers import StoppingCriteria, StoppingCriteriaList
 from typing import List
 import torch
 
-# Load Model and Tokenizer
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from peft import get_peft_model, LoraConfig
+
+import contextlib
+import accelerate
+
+accelerator = accelerate.Accelerator()
+accelerator.device
+
+@contextlib.contextmanager
+def set_left_padding(tokenizer):
+    # Store the original padding side
+    original_padding_side = tokenizer.padding_side
+    original_truncation_side = tokenizer.truncation_side
+    tokenizer.truncation_side='left'
+    # Set padding side to left
+    tokenizer.padding_side = "left"
+    try:
+        yield tokenizer
+    finally:
+        # Restore original padding side
+        tokenizer.padding_side = original_padding_side
+        tokenizer.truncation_side = original_truncation_side
+
+
+# 加载模型和 tokenizer
 model_name = "/mnt/hwfile/ai4chem/CKPT/longcot_pt_GEMMA_ZD_10_23_1"
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 model = AutoModelForCausalLM.from_pretrained(
-    model_name, device_map="auto", torch_dtype=torch.bfloat16
+    model_name, device_map="auto", torch_dtype=torch.bfloat16, use_cache=True
 )
+
+# 设置 LoRA 配置
+lora_config = LoraConfig(
+    r=8,  # 低秩矩阵的秩
+    lora_alpha=16,  # LoRA 的缩放系数
+    target_modules=["q_proj", "v_proj"],  # 目标模块，通常是查询和键的投影层
+    lora_dropout=0.1,  # dropout 概率
+    bias="none",  # 不在 LoRA 中包含偏置
+)
+
+# 使用 peft 将模型转换为 LoRA 微调模型
+model = get_peft_model(model, lora_config)
+
+print("Model successfully converted to LoRA format.")
+
 select_prefix = ""
 meta_action_types = ["<problem>", "<critic>", "<refine>", "<conclusion>"]
 meta_action_types_weight = [0.2, 0.4, 0.4, 0.3]
 
-GT = "Natalia sold 48/2 = <<48/2=24>>24 clips in May. Natalia sold 48+24 = <<48+24=72>>72 clips altogether in April and May. #### 72"
+GT = f"#### 23"
 
-# hint = f'<hint> Try generate a reasonable rationale step to approching The true final answer, "{GT}" </hint>'
-hint = ''
+hint = f'<hint> Try generate a reasonable rationale solution that can got final answer </hint>'
+# hint = ''
 
-hint_for_divide_and_conquer = f'<hint> Try divide the problem into smaller parts and solve them separately. </hint>'
+
+hint_for_critics = f"<hint> Point out the potential flaws in the current solution. </hint>"
+hint_for_refine = f"<hint> Try to refine the current solution for higher quality. </hint>"
+hint_for_conclusion = "<hint> Try to summarize the current solution and draw a conclusion. Final answer should bracket in \\box{answer} </hint>"
+hint_for_divide_and_conquer = f"<hint> Try divide the problem into smaller easier sub-problems and solve them divide-and-conquer. </hint>"
+
+
+CHUNCKED_INFERENCE_LENGTH = 64
+LN_2 = 0.69314718056  # ln(2) = 1.0 / LOG2_E
+GENERATE_MAX_NEW_TOKENS = 256
+CUT_OFF_LEN = 1024
+
+import torch
+
+
+def chunked_forward_with_attention_sink(
+    model,
+    tokenizer,
+    text,
+    chunk_size=256,
+    attention_window=512,
+):
+    torch.cuda.empty_cache()  # 清空显存
+    # 初始化输入和设置设备
+    with set_left_padding(tokenizer):
+        inputs = tokenizer(
+            text,
+            return_tensors="pt",
+            padding="longest",  # Enable padding
+            pad_to_multiple_of=chunk_size,  # Pad to nearest multiple of chunk_size
+        )
+    inputs = {k: v.to(accelerator.device) for k, v in inputs.items()}
+    input_ids = inputs["input_ids"]
+    attention_mask = inputs["attention_mask"]
+
+    # 将输入序列分块
+    input_chunks = torch.split(input_ids, chunk_size, dim=1)
+    mask_chunks = torch.split(attention_mask, chunk_size, dim=1)
+
+    # 初始化生成的文本和past_key_values（注意力缓存）
+    past_key_values = None
+    logits_outputs = []
+
+    # Step 1: 分块进行 forward 操作，更新past_key_values
+    for i, (input_chunk, mask_chunk) in enumerate(zip(input_chunks, mask_chunks)):
+        # print(i, input_ids.shape[1],input_chunk.shape)
+        chunk_inputs = {
+            "input_ids": input_chunk,
+            "attention_mask": mask_chunk,
+            "past_key_values": past_key_values,
+        }
+        outputs = model(**chunk_inputs, use_cache=True, return_dict=True)
+        past_key_values = outputs.past_key_values  # 更新past_key_values
+        logits_outputs.append(outputs.logits)
+
+    # 合并所有子块的 logits
+    final_logits = torch.cat(logits_outputs, dim=1)
+    return final_logits
+
+
+def chunked_generate_with_attention_sink(
+    model,
+    tokenizer,
+    text,
+    chunk_size=256,
+    max_new_tokens=1024,
+    attention_window=512,
+    device="cuda",
+    stop_strings=None,
+    temperature=0.8,
+):
+    """
+    分块生成文本，并通过Attention Sink在有限内存环境中进行高效流式生成。
+
+    参数：
+    - model: 预训练的Hugging Face模型
+    - tokenizer: Hugging Face的分词器
+    - text: 输入文本（str）
+    - chunk_size: 每个分块的长度（默认为256）
+    - max_new_tokens: 最大生成长度
+    - attention_window: 最大注意力窗口；超出该长度的token会被丢弃
+    - device: 设备（默认为"cuda"）
+
+    返回：
+    - generated_text: 完整的生成文本
+    """
+    max_new_tokens = (
+        max_new_tokens // chunk_size * chunk_size
+    )  # Ensure max_new_tokens is a multiple of chunk_size
+    end_token_ids = [tokenizer.convert_tokens_to_ids(token) for token in stop_strings]
+    torch.cuda.empty_cache()  # 清空显存
+    # 初始化输入和设置设备
+    with set_left_padding(tokenizer):
+        inputs = tokenizer(
+            text,
+            return_tensors="pt",
+            padding="longest",  # Enable padding
+            pad_to_multiple_of=chunk_size,  # Pad to nearest multiple of chunk_size
+        )
+    inputs = {k: v.to(accelerator.device) for k, v in inputs.items()}
+    input_ids = inputs["input_ids"]
+    attention_mask = inputs["attention_mask"]
+
+    # 将输入序列分块
+    input_chunks = torch.split(input_ids, chunk_size, dim=1)
+    mask_chunks = torch.split(attention_mask, chunk_size, dim=1)
+
+    # 初始化生成的文本和past_key_values（注意力缓存）
+    past_key_values = None
+    generated_text = text
+    stacked_input_ids = []
+    stacked_logits = []
+
+    with torch.no_grad():
+        # Step 1: 分块进行 forward 操作，更新past_key_values
+        for i, (input_chunk, mask_chunk) in enumerate(
+            zip(input_chunks[:-1], mask_chunks[:-1])
+        ):
+            # print(i, input_ids.shape[1],input_chunk.shape)
+            chunk_inputs = {
+                "input_ids": input_chunk,
+                "attention_mask": mask_chunk,
+                "past_key_values": past_key_values,
+            }
+            outputs = model(**chunk_inputs, use_cache=True)
+            past_key_values = outputs.past_key_values  # 更新past_key_values
+
+        input_chunk = input_chunks[-1]
+        mask_chunk = mask_chunks[-1]
+        # Step 2: 分块生成新token
+        for _ in range(0, max_new_tokens, chunk_size):
+            gen_inputs = {
+                "input_ids": input_chunk,
+                "attention_mask": mask_chunk,
+                "past_key_values": past_key_values,
+            }
+            outputs = model.generate(
+                **gen_inputs,
+                max_new_tokens=chunk_size,
+                use_cache=True,
+                stop_strings=stop_strings,
+                tokenizer=tokenizer,
+                output_logits=True,
+                return_dict_in_generate=True,
+                cache_implementation=None,
+                do_sample=True,
+                temperature=temperature,
+            )
+            gen_ids = outputs.sequences
+            logits = outputs.logits
+
+            if isinstance(outputs.logits, tuple):
+                logits = torch.stack(outputs.logits, dim=0)
+            else:
+                logits = outputs.logits  # If already a tensor
+            stacked_logits.append(logits)
+            # 将生成的内容拼接到总结果中
+            stacked_input_ids.append(gen_ids[:, -logits.shape[0] :])
+            input_chunk = gen_ids
+            mask_chunk = torch.ones_like(input_ids)
+            # print(input_chunk.shape)
+            # 如果生成到达停止标记或到达最大生成长度则停止
+            if logits.shape[0] < chunk_size:
+                break
+
+            # 更新past_key_values
+            past_key_values = outputs.past_key_values
+            # print(outputs.past_key_values)
+
+        # 整合所有生成的id和logits
+        final_output_ids = torch.cat(stacked_input_ids, dim=1)
+        final_logits = torch.cat(stacked_logits, dim=0) if stacked_logits else None
+
+    return (
+        tokenizer.decode(final_output_ids[0], skip_special_tokens=False),
+        final_output_ids,
+        final_logits,
+    )
 
 
 # Tree Node Structure
@@ -40,11 +261,14 @@ class TreeNode:
         self.visits = 0  # Number of visits
         self.value = 0  # Value estimate of the current node
         self.policy = {}  # Policy probabilities for selecting child nodes
+        self.policy_entropy = {}
+        self.policy_varentropy = {}
         self.policy_cal_ready_texts = ""
         self.value_cal_ready_texts = ""
         self.true_value_from_tree = None
         self.leaf_type = ""
         self.rectify_visits = 0
+        self.original_value = 0
 
     def add_child(self, child_node):
         self.children.append(child_node)
@@ -54,16 +278,27 @@ class TreeNode:
 
     def get_child_policy_prob(self, child):
         # 提取logit值并转换为数组
-        logits = np.array(list(self.policy.values()))
-
-        # 计算Softmax概率
-        exp_logits = np.exp(logits - np.max(logits))  # 减去最大logit值以增强数值稳定性
-        softmax_probs = exp_logits / np.sum(exp_logits)
+        logits = torch.tensor(list(self.policy.values()))
+        prob, log_prob = robust_softmax(logits)
 
         # 构建新的字典，将键与Softmax概率对应
-        return {key: prob for key, prob in zip(self.policy.keys(), softmax_probs)}[
-            child
-        ]
+        return {key: prob for key, prob in zip(self.policy.keys(), prob)}[child]
+    
+    def get_child_policy_entropy(self, child):
+        # 提取logit值并转换为数组
+        logits = torch.tensor(list(self.policy_entropy.values()))
+        prob, log_prob = robust_softmax(logits)
+
+        # 构建新的字典，将键与Softmax概率对应
+        return {key: prob for key, prob in zip(self.policy_entropy.keys(), prob)}[child]
+    
+    def get_child_policy_varentropy(self, child):
+        # 提取logit值并转换为数组
+        logits = torch.tensor(list(self.policy_varentropy.values()))
+        prob, log_prob = robust_softmax(logits)
+
+        # 构建新的字典，将键与Softmax概率对应
+        return {key: prob for key, prob in zip(self.policy_varentropy.keys(), prob)}[child]
 
 
 def value_to_rating_token(value):
@@ -133,14 +368,6 @@ def value_head_template(selected_node):
     )
 
 
-def hard_orm_head_template(selected_node):
-    return f"For problem {get_root(selected_node).state}, the answer is {selected_node.state}, is it true?"
-
-
-def soft_orm_head_template(selected_node, gt):
-    return f"For problem {get_root(selected_node).state}, the ground truth is {gt}, the predicted answer is {selected_node.state}, is it the predicted answer true?"
-
-
 selection_head_stopping_criteria = ["<end_of_father_id>"]
 
 policy_head_stopping_criteria = ["<end_of_thought>"]
@@ -148,21 +375,46 @@ policy_head_stopping_criteria = ["<end_of_thought>"]
 value_head_stopping_criteria = ["<end_of_rating>"]
 
 
-def length_normed_logit(sequence_ids, scores_tensor):
+def robust_softmax(logits):
+    log_probs = F.log_softmax(logits - logits.max(), dim=-1)
+    probs = torch.exp(log_probs)
+    return probs, log_probs
+
+
+def length_normed_log_probs(
+    sequence_ids, logits_tensor, return_entropy=False, return_varentropy=False
+):
 
     # Gather the log probabilities using advanced indexing
     # For each sequence and each position, select the log probability of the generated token
-    selected_logits = torch.gather(
-        scores_tensor.transpose(0, 1), 2, sequence_ids.unsqueeze(-1)
+    # https://github.com/xjdr-alt/entropix/blob/e55e9a38cb6fb7ad23e9fe68196c61a257a3da52/entropix/torch_sampler.py#L15
+
+    probs, log_probs = robust_softmax(logits_tensor)
+
+    selected_log_probs = torch.gather(
+        log_probs.transpose(0, 1), 2, sequence_ids.unsqueeze(-1)
     ).squeeze(-1)
 
     # Sum the log probabilities for each sequence
-    summed_log_probs = selected_logits.sum(dim=1)
+    summed_log_probs = selected_log_probs.sum(dim=1)
 
     # Normalize by sequence length
     normalized_log_probs = summed_log_probs / sequence_ids.size(1)
 
-    return normalized_log_probs
+    # Compute entropy and variance of entropy
+
+    entropy = -torch.sum(probs * log_probs, dim=-1) / LN_2  # Convert to base-2
+    varentropy = torch.sum(
+        probs * (log_probs / LN_2 + entropy.unsqueeze(-1)) ** 2, dim=-1
+    )
+
+    summed_entropy = entropy.sum(dim=0)
+    normalized_entropy = summed_entropy / sequence_ids.size(1)
+
+    summed_varentropy = varentropy.sum(dim=0)
+    normalized_varentropy = summed_varentropy / sequence_ids.size(1)
+
+    return normalized_log_probs, normalized_entropy, normalized_varentropy
 
 
 # # Compute neural UCB Head (p(a|s))
@@ -191,112 +443,190 @@ def clean_generated_text(text):
 
 
 @torch.no_grad()
-def meta_compute_policy_head(selected_node, num_candidates=3):
-    if random.random() > 0.25:
-        text, probs = compute_policy_head(selected_node, num_candidates)
-        return text, probs.tolist()
+def meta_compute_policy_head(selected_node, num_candidates=3, meta_ratio=0.80):
+    if random.random() < meta_ratio:
+        generated_texts, normalized_log_probs, normalized_entropy, varentropy = (
+            compute_policy_head(selected_node, num_candidates)
+        )
+        return generated_texts, normalized_log_probs.tolist(), normalized_entropy.tolist(), varentropy.tolist()
 
     metas = random.choices(
         meta_action_types, meta_action_types_weight, k=num_candidates
     )
     generated_texts = []
-    policy_probs = []
+    policy_logits = []
+    normalized_entropys = []
+    varentropys = []
     for i, meta in enumerate(metas):
-        texts, policy_probs_0 = compute_policy_head(
+        texts, policy_probs, normalized_entropy, varentropy = compute_policy_head(
             selected_node, num_candidates=1, meta=meta
         )
         generated_texts.append(texts[0])
-        policy_probs.append(policy_probs_0.tolist()[0])
-    return generated_texts, torch.tensor(policy_probs).tolist()
+        policy_logits.append(policy_probs.item())
+        normalized_entropys.append(normalized_entropy.item())
+        varentropys.append(varentropy.item())
+    return generated_texts, policy_logits, normalized_entropys, varentropys
 
 
 # Optimized Compute Policy Head (p(a|s))
 @torch.no_grad()
 def compute_policy_head(selected_node, num_candidates=3, meta=""):
-    if meta != "<conclusion>":
-        if meta == '<problem>':
-            inputs_string = policy_head_template(
-                selected_node, get_max_node_id_in_tree(selected_node) + 1, meta, hint_for_divide_and_conquer
-            )
-        else:
-            inputs_string = policy_head_template(
-                selected_node, get_max_node_id_in_tree(selected_node) + 1, meta, hint
-            )
+    if meta == "<conclusion>":
+        inputs_string = policy_head_template(
+            selected_node, get_max_node_id_in_tree(selected_node) + 1, meta, hint_for_critics
+        )
+    elif meta == "<problem>":
+        inputs_string = policy_head_template(
+            selected_node,
+            get_max_node_id_in_tree(selected_node) + 1,
+            "",
+            hint_for_divide_and_conquer,
+        )
+    elif meta == "<critic>":
+        inputs_string = policy_head_template(
+            selected_node,
+            get_max_node_id_in_tree(selected_node) + 1,
+            meta,
+            hint_for_critics,
+        )
+    elif meta == "<refine>":
+        inputs_string = policy_head_template(
+            selected_node,
+            get_max_node_id_in_tree(selected_node) + 1,
+            meta,
+            hint_for_refine,
+        )
     else:
         inputs_string = policy_head_template(
-            selected_node, get_max_node_id_in_tree(selected_node) + 1, meta, ""
+            selected_node, get_max_node_id_in_tree(selected_node) + 1, '',hint 
         )
-    inputs = tokenizer(inputs_string, return_tensors="pt")
-    inputs = {k: v.to(model.device) for k, v in inputs.items()}
-    outputs = model.generate(
-        **inputs,
-        max_new_tokens=256,
-        do_sample=True,
-        num_return_sequences=num_candidates,
-        output_logits=True,
-        return_dict_in_generate=True,
-        stop_strings=policy_head_stopping_criteria,
-        tokenizer=tokenizer,
-    )
 
-    # Extract generated sequences and scores
-    output_ids = outputs.sequences
+    if len(inputs_string) > CHUNCKED_INFERENCE_LENGTH and False:
 
-    if isinstance(outputs.logits, tuple):
-        logits = torch.stack(outputs.logits, dim=0)
+        generated_texts = []
+        log_probs_list = []
+        entropy_list = []
+        varentropy_list = []
+        for i in range(num_candidates):
+            generated_text, output_ids, logits = chunked_generate_with_attention_sink(
+                model,
+                tokenizer,
+                inputs_string,
+                chunk_size=CHUNCKED_INFERENCE_LENGTH,
+                stop_strings=policy_head_stopping_criteria,
+                max_new_tokens=GENERATE_MAX_NEW_TOKENS,
+            )
+            # print(generated_text, output_ids.shape, logits.shape)
+            generated_texts.append(generated_text)
+
+            normalized_log_probs, normalized_entropy, varentropy = (
+                length_normed_log_probs(output_ids[:, -logits.shape[0] :], logits)
+            )
+            # print(normalized_log_probs.shape, normalized_entropy.shape, varentropy.shape)
+            log_probs_list.append(normalized_log_probs.item())
+            entropy_list.append(normalized_entropy.item())
+            varentropy_list.append(varentropy.item())
+        normalized_log_probs, normalized_entropy, varentropy = (
+            torch.tensor(log_probs_list),
+            torch.tensor(entropy_list),
+            torch.tensor(varentropy_list),
+        )
     else:
-        logits = outputs.logits  # If already a tensor
+        with set_left_padding(tokenizer):
+            inputs = tokenizer(inputs_string, return_tensors="pt", truncation=True, padding=True, max_length=CUT_OFF_LEN)
+        inputs = {k: v.to(accelerator.device) for k, v in inputs.items()}
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=GENERATE_MAX_NEW_TOKENS,
+            do_sample=True,
+            num_return_sequences=num_candidates,
+            output_logits=True,
+            return_dict_in_generate=True,
+            stop_strings=policy_head_stopping_criteria,
+            tokenizer=tokenizer,
+        )
 
-    normalized_logits = length_normed_logit(output_ids[:, -logits.shape[0] :], logits)
+        # Extract generated sequences and scores
+        output_ids = outputs.sequences
 
-    generated_texts = tokenizer.batch_decode(
-        output_ids[:, -logits.shape[0] :], skip_special_tokens=False
-    )
+        if isinstance(outputs.logits, tuple):
+            logits = torch.stack(outputs.logits, dim=0)
+        else:
+            logits = outputs.logits  # If already a tensor
+
+        generated_texts = tokenizer.batch_decode(
+            output_ids[:, -logits.shape[0] :], skip_special_tokens=False
+        )
+
+        normalized_log_probs, normalized_entropy, varentropy = length_normed_log_probs(
+            output_ids[:, -logits.shape[0] :], logits
+        )
 
     generated_texts = [meta + clean_generated_text(text) for text in generated_texts]
 
     if meta != "<conclusion>":
-        for i,generated_text in enumerate(generated_texts):
-            if "The answer is:" in generated_text:
-                generated_texts[i] = '<conclusion>' + generated_texts[i]
+        for i, generated_text in enumerate(generated_texts):
+            if "The answer is:" in generated_text and not generated_texts[i].startswith(
+                "<conclusion>"
+            ):
+                generated_texts[i] = "<conclusion>" + generated_texts[i]
 
-    return generated_texts, normalized_logits
+    if meta == "<problem>":
+        for i, generated_text in enumerate(generated_texts):
+            if not generated_texts[i].startswith("<problem>"):
+                generated_texts[i] = "<problem>" + generated_texts[i]
+    elif meta == "<critic>":
+        for i, generated_text in enumerate(generated_texts):
+            if not generated_texts[i].startswith("<critic>"):
+                generated_texts[i] = "<critic>" + generated_texts[i]
+    elif meta == "<refine>":
+        for i, generated_text in enumerate(generated_texts):
+            if not generated_texts[i].startswith("<refine>"):
+                generated_texts[i] = "<refine>" + generated_texts[i]
+    elif meta == "<conclusion>":
+        for i, generated_text in enumerate(generated_texts):
+            if not generated_texts[i].startswith("<conclusion>"):
+                generated_texts[i] = "<conclusion>" + generated_texts[i]
+
+    return generated_texts, normalized_log_probs, normalized_entropy, varentropy
 
 
 @torch.no_grad()
 def compute_value_head(selected_node):
-    if selected_node.value != 0:
-        return selected_node.value
     # 将state传入tokenizer并获取模型输入
     inputs_string = value_head_template(selected_node)
-    inputs = tokenizer(inputs_string, return_tensors="pt")
-    inputs = {k: v.to(model.device) for k, v in inputs.items()}
-    # 使用模型生成outputs
-    outputs = model.generate(
-        **inputs,
-        max_new_tokens=2,
-        # do_sample=True,
-        # num_return_sequences=1,
-        output_logits=True,
-        return_dict_in_generate=True,
-        stop_strings=value_head_stopping_criteria,
-        tokenizer=tokenizer,
-    )
-
-    # 获取生成的序列
-    output_ids = outputs.sequences
-
-    # 提取logits
-    if isinstance(outputs.logits, tuple):
-        logits = torch.stack(outputs.logits, dim=0)
+    if len(inputs_string) > CHUNCKED_INFERENCE_LENGTH and False:
+        logits = chunked_forward_with_attention_sink(
+            model, tokenizer, inputs_string, chunk_size=CHUNCKED_INFERENCE_LENGTH
+        )
+        last_second_logits = logits[:, -1, :]  # 倒数第二个位置的logit
     else:
-        logits = outputs.logits  # 如果 logits 已是张量
+        with set_left_padding(tokenizer):
+            inputs = tokenizer(inputs_string, return_tensors="pt", truncation=True, padding=True, max_length=CUT_OFF_LEN)
+        inputs = {k: v.to(accelerator.device) for k, v in inputs.items()}
+        # 使用模型生成outputs
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=2,
+            # do_sample=True,
+            # num_return_sequences=1,
+            output_logits=True,
+            return_dict_in_generate=True,
+            stop_strings=value_head_stopping_criteria,
+            tokenizer=tokenizer,
+        )
 
-    # 定位倒数第二个位置的logit
-    if logits.size(0) < 1:
-        raise ValueError("生成序列太短，无法提取倒数第二个位置的logit。")
+        # 提取logits
+        if isinstance(outputs.logits, tuple):
+            logits = torch.stack(outputs.logits, dim=0)
+        else:
+            logits = outputs.logits  # 如果 logits 已是张量
 
-    last_second_logits = logits[-1, :, :]  # 倒数第二个位置的logit
+        # 定位倒数第二个位置的logit
+        if logits.size(0) < 1:
+            raise ValueError("生成序列太短，无法提取倒数第二个位置的logit。")
+
+        last_second_logits = logits[-1, :, :]  # 倒数第二个位置的logit
 
     # 获取 "<positive_rating>" 和 "<negative_rating>" 的token ID
     positive_token_id = tokenizer.convert_tokens_to_ids("<positive_rating>")
@@ -307,53 +637,17 @@ def compute_value_head(selected_node):
     negative_logit = last_second_logits[:, negative_token_id]
 
     # 将两者结合计算 value
-    value = positive_logit - negative_logit  # 或根据需要使用其他计算方式
+    # value = positive_logit - negative_logit  # 或根据需要使用其他计算方式
+    prob, log_prob = robust_softmax(torch.cat([positive_logit, negative_logit], dim=0))
 
-    return torch.tanh(value).item()
+    return log_prob[0].item()
 
 
-def compute_soft_orm_head(selected_node):
-    # 将state传入tokenizer并获取模型输入
-    inputs_string = soft_orm_head_template(selected_node, GT)
-    inputs = tokenizer(inputs_string, return_tensors="pt")
-    inputs = {k: v.to(model.device) for k, v in inputs.items()}
-    # 使用模型生成outputs
-    outputs = model.generate(
-        **inputs,
-        max_new_tokens=1,
-        # do_sample=True,
-        # num_return_sequences=1,
-        output_logits=True,
-        return_dict_in_generate=True,
-        stop_strings=value_head_stopping_criteria,
-        tokenizer=tokenizer,
-    )
-
-    # 获取生成的序列
-    output_ids = outputs.sequences
-
-    # 提取logits
-    if isinstance(outputs.logits, tuple):
-        logits = torch.stack(outputs.logits, dim=0)
+def compute_acummlated_path_reward(node):
+    if not node.parent:  # root node
+        return 0.0
     else:
-        logits = outputs.logits  # 如果 logits 已是张量
-
-    # 定位倒数第二个位置的logit
-    if logits.size(0) < 1:
-        # print(logits.shape)
-        raise ValueError("生成序列太短，无法提取倒数第二个位置的logit。")
-
-    last_second_logits = logits[-1, :, :]  # 倒数第二个位置的logit
-
-    # 获取 "<positive_rating>" 和 "<negative_rating>" 的token ID
-    positive_token_id = tokenizer.convert_tokens_to_ids("True")
-    negative_token_id = tokenizer.convert_tokens_to_ids("False")
-
-    # 提取 "<positive_rating>" 和 "<negative_rating>" 的logit
-    positive_logit = last_second_logits[:, positive_token_id]
-    negative_logit = last_second_logits[:, negative_token_id]
-
-    return positive_logit > negative_logit
+        return node.value + compute_acummlated_path_reward(node.parent)
 
 
 from grading import check
@@ -366,19 +660,42 @@ def compute_rule_orm_head(selected_node):
     return result
 
 
+def get_max_reward_in_path(node):
+    if not node.parent:
+        return node.value
+    else:
+        return max(node.value, get_max_reward_in_path(node.parent))
+
+
+def reward_normalize(reward, maximum, minimum):
+    return (reward - minimum) / (maximum - minimum)
+
+
 # MCTS Search
 class MCTS:
-    def __init__(self, model, tokenizer, num_simulations=-1, exploration_const=1.0):
+    def __init__(
+        self,
+        model,
+        tokenizer,
+        num_simulations=-1,
+        num_candidates_per_expansion=2,
+        exploration_const=1.0,
+        discount_factor=0.9,
+        reward_epsilon=1e-6,
+    ):
         self.model = model
         self.tokenizer = tokenizer
-        self.num_simulations = num_simulations if num_simulations != -1 else 999
+        self.num_simulations = num_simulations if num_simulations != -1 else 32
         self.exploration_const = exploration_const
         self.end = False
-        self.discount_factor = 0.7
+        self.discount_factor = discount_factor
+        self.num_candidates = num_candidates_per_expansion
+        self.reward_epsilon = reward_epsilon
+        self.varentropy_lambda = 0.1
 
     def search(self, root_node):
         if not root_node.children:
-            root_node.value = compute_value_head(root_node)
+            root_node.value = 0
 
         for _ in range(self.num_simulations):
             self.simulate(root_node)
@@ -387,9 +704,9 @@ class MCTS:
 
         for leaf in self.identify_leaf(root_node):
             if leaf.leaf_type == "successful":
-                self.rectify_values_from_leaf(leaf, 1)
+                self.rectify_values_from_leaf(leaf, 0)
             else:
-                self.rectify_values_from_leaf(leaf, -1)
+                self.rectify_values_from_leaf(leaf, np.log(self.reward_epsilon))
 
         return root_node
 
@@ -403,17 +720,23 @@ class MCTS:
             value = self.simulate(best_child) * self.discount_factor
         node.visits += 1
         node.value += (value - node.value) / node.visits
+        # if '<critic>' in node.state:
+        #     return -node.value
+        # else:
+        #     return node.value
         return node.value
 
     def expand_node(self, node):
-        texts, policy_probs = meta_compute_policy_head(node)
+        texts, policy_probs, entropys, varentropys = meta_compute_policy_head(node, self.num_candidates)
 
-        for i, text in enumerate(texts):
+        for i, (text, policy_prob, entropy, varentropy) in enumerate(zip(texts, policy_probs, entropys, varentropys)):
             child_node = TreeNode(
                 state=text, parent=node, index=get_max_node_id_in_tree(node) + 1
             )
             # child_node.policy = policy_probs[i]
-            node.policy[child_node] = policy_probs[i]
+            node.policy[child_node] = policy_prob
+            node.policy_entropy[child_node] = entropy
+            node.policy_varentropy[child_node] = varentropy
             node.add_child(child_node)
             child_node.value = self.compute_value(child_node)
             if "<conclusion>" in child_node.state:
@@ -422,13 +745,16 @@ class MCTS:
                     child_node.leaf_type = "successful"
                 else:
                     child_node.leaf_type = "failed"
-            print(f"Id:{child_node.index}, Child: {text}, Policy: {policy_probs[i]}, Value: {child_node.value}")
+            print(
+                f"Id:{child_node.index}, Child: {text}, Policy: {math.exp(policy_prob)}, Value: {math.exp(child_node.value)}"
+            )
         return max(child_node.value for child_node in node.children)
 
     def compute_value(self, node):
         # Use the model to predict the value of the current state
         value = compute_value_head(node)
         node.value = value
+        node.original_value = copy.deepcopy(value)
         return value
 
     def select_action(self, node):
@@ -438,19 +764,14 @@ class MCTS:
                 child.value
                 + self.exploration_const
                 * node.get_child_policy_prob(child)
+                * node.get_child_policy_entropy(child)
                 * np.sqrt(total_visits)
                 / (1 + child.visits)
+                + self.varentropy_lambda * node.get_child_policy_varentropy(child)
             )
             for child in node.children
         ]
         return node.children[np.argmax(ucb_scores)]
-
-    # def get_policy_from_visits(self, node):
-    #     total_visits = sum(child.visits for child in node.children)
-    #     policy = {
-    #         i: child.visits / total_visits for i, child in enumerate(node.children)
-    #     }
-    #     return policy
 
     def identify_leaf(self, node):
         result = set()
@@ -464,54 +785,57 @@ class MCTS:
 
     def rectify_values_from_leaf(self, node, value):
         node.rectify_visits += 1
-        if node.leaf_type == "successful" and node.is_leaf():
+
+        if not node.true_value_from_tree:
             node.true_value_from_tree = value
-            # node.value = value
-            if node.parent:
-                self.rectify_values_from_leaf(
-                    node.parent, node.true_value_from_tree * self.discount_factor
-                )
-        elif node.leaf_type == "failed" and node.is_leaf():
-            node.true_value_from_tree = value
-            # node.value = value
-            if node.parent:
-                self.rectify_values_from_leaf(
-                    node.parent, node.true_value_from_tree * self.discount_factor
-                )
-        elif not node.is_leaf():
-            if not node.true_value_from_tree:
-                # node.value = value
-                node.true_value_from_tree = value
-            else:
-                node.true_value_from_tree += (
-                    value - node.true_value_from_tree
-                ) / node.rectify_visits
-                # node.true_value_from_tree = 1 if node.value >= 0 else -1
-            if node.parent:
-                self.rectify_values_from_leaf(
-                    node.parent, node.true_value_from_tree * self.discount_factor
-                )
+        else:
+            node.true_value_from_tree += (
+                value - node.true_value_from_tree
+            ) / node.rectify_visits
+        if node.parent:
+            self.rectify_values_from_leaf(
+                node.parent, node.true_value_from_tree * self.discount_factor
+            )
 
 
-def training_time_predict(node):
+@lru_cache(maxsize=1000)
+def training_time_policy_predict(node, model):
     # Use the model to predict the value of the current state
     text_for_policy = policy_head_template(node.parent, node.index) + node.state
-    inputs = tokenizer(text_for_policy, return_tensors="pt")
-    target = tokenizer(node.state, return_tensors="pt")
-    inputs = {k: v.to(model.device) for k, v in inputs.items()}
-    target = {k: v.to(model.device) for k, v in target.items()}
-    outputs = model(**inputs, return_dict=True)
-    logits = outputs.logits
-    # print(target["input_ids"].shape,logits.shape)
-    normed_logit = length_normed_logit(
-        target["input_ids"].transpose(0, 1), logits[:,-target["input_ids"].shape[-1] :]
-    )
+    if len(text_for_policy) > CHUNCKED_INFERENCE_LENGTH and False:
+        logits = chunked_forward_with_attention_sink(
+            model, tokenizer, text_for_policy, chunk_size=CHUNCKED_INFERENCE_LENGTH
+        )
+    else:
+        inputs = tokenizer(text_for_policy, return_tensors="pt")
+        inputs = {k: v.to(accelerator.device) for k, v in inputs.items()}
+        outputs = model(**inputs, return_dict=True)
+        logits = outputs.logits
 
+    target = tokenizer(node.state, return_tensors="pt")
+    target = {k: v.to(accelerator.device) for k, v in target.items()}
+    # print(target["input_ids"].shape,logits.shape)
+    normalized_log_probs, normalized_entropy, varentropy = length_normed_log_probs(
+        target["input_ids"].transpose(0, 1), logits[:, -target["input_ids"].shape[-1] :]
+    )
+    # print(normed_logit.shape)
+    return normalized_log_probs
+
+
+@lru_cache(maxsize=1000)
+def training_time_value_predict(node):
     text_for_value = value_head_template(node) + value_to_rating_token(node.value)
-    inputs = tokenizer(text_for_value, return_tensors="pt")
-    inputs = {k: v.to(model.device) for k, v in inputs.items()}
-    outputs = model(**inputs, return_dict=True)
-    logits = outputs.logits
+
+    if len(text_for_value) > CHUNCKED_INFERENCE_LENGTH and False:
+        logits = chunked_forward_with_attention_sink(
+            model, tokenizer, text_for_value, chunk_size=CHUNCKED_INFERENCE_LENGTH
+        )
+    else:
+        inputs = tokenizer(text_for_value, return_tensors="pt")
+        inputs = {k: v.to(accelerator.device) for k, v in inputs.items()}
+        outputs = model(**inputs, return_dict=True)
+        logits = outputs.logits
+
     last_second_logits = logits[:, -1, :]  # 倒数第一个位置的logit
 
     # 获取 "<positive_rating>" 和 "<negative_rating>" 的token ID
@@ -524,14 +848,17 @@ def training_time_predict(node):
 
     value_logit = torch.cat([positive_logit, negative_logit], dim=0).unsqueeze_(0)
 
-    return normed_logit, value_logit
+    return value_logit
+    # value_logit = positive_logit - negative_logit
+
+    # return torch.tanh(value_logit)
 
 
 # Model Training using MCTS policy and value
 criterion_policy = torch.nn.CrossEntropyLoss()
 # criterion_value = torch.nn.MSELoss()
 criterion_value = torch.nn.CrossEntropyLoss()
-optimizer = optim.Adam(model.parameters(), lr=5e-5)
+optimizer = optim.AdamW(model.parameters(), lr=5e-5, weight_decay=0.01)
 
 
 def traverse_tree(node):
@@ -565,13 +892,22 @@ def ppo_loss_clip(old_probs, new_probs, advantages, epsilon=0.2):
     # 返回PPO的最终损失
     return -torch.min(unclipped_loss, clipped_loss).mean()
 
-def ppo_loss(old_probs, new_probs, advantages, kl_penalty_coeff=0.1, desired_kl=0.01, epsilon=0.2):
+
+def ppo_loss(
+    old_probs,
+    new_probs,
+    advantages,
+    kl_penalty_coeff=0.1,
+    desired_kl=0.01,
+    epsilon=0.2,
+    entropy_coeff=0.01,
+):
     # print(f"Old Probs: {old_probs}")
     # print(f"New Probs: {new_probs}")
     # print(f"Advantages: {advantages}")
 
     # 计算策略比率
-    ratios = new_probs / (old_probs + 1e-8)
+    ratios = new_probs / (old_probs.detach() + 1e-8)
     # print(f"Ratios: {ratios}")
 
     # 计算clipped和未clipped的损失
@@ -582,7 +918,9 @@ def ppo_loss(old_probs, new_probs, advantages, kl_penalty_coeff=0.1, desired_kl=
     clipped_loss = clipped_ratios * advantages
 
     # 计算KL散度
-    kl_divergence = old_probs * (torch.log(old_probs + 1e-8) - torch.log(new_probs + 1e-8))
+    kl_divergence = old_probs.detach() * (
+        torch.log(old_probs.detach() + 1e-8) - torch.log(new_probs + 1e-8)
+    )
     kl_divergence = kl_divergence.sum(dim=-1).mean()
     # print(f"KL Divergence: {kl_divergence}")
 
@@ -594,12 +932,12 @@ def ppo_loss(old_probs, new_probs, advantages, kl_penalty_coeff=0.1, desired_kl=
         kl_penalty_coeff *= 0.5  # 减少惩罚
         # print(f"Decreasing KL Penalty Coefficient to {kl_penalty_coeff}")
 
-    # 总损失 = Clipped PPO 损失 - KL 惩罚项
     ppo_loss = -torch.min(unclipped_loss, clipped_loss).mean()
-    total_loss = ppo_loss + kl_penalty_coeff * kl_divergence
+
+    entropy = -(new_probs * torch.log(new_probs + 1e-8)).sum(dim=-1).mean()
+    total_loss = ppo_loss + kl_penalty_coeff * kl_divergence - entropy_coeff * entropy
 
     return total_loss
-
 
 
 def compute_gae(rewards, values, gamma=0.99, lam=0.95):
@@ -633,11 +971,23 @@ def compute_gae(rewards, values, gamma=0.99, lam=0.95):
     return advantages
 
 
-def train_model_with_ppo_gae(root_node, optimizer, epsilon=0.2, gamma=0.99, lam=0.95):
+def train_model_with_ppo_gae(
+    root_node,
+    optimizer,
+    epsilon=0.2,
+    gamma=0.99,
+    lam=0.95,
+    lreg=0.01,
+    accumulation_steps=8,
+):
     optimizer.zero_grad()
     policy_loss = 0
     value_loss = 0
-    # regularization_loss = 0
+    step_count = 0
+    total_loss = 0
+    policy_loss_list = []
+    value_loss_list = []
+    total_loss_list = []
 
     # 存储所有 episode 的奖励和价值预测
     rewards = []
@@ -645,68 +995,97 @@ def train_model_with_ppo_gae(root_node, optimizer, epsilon=0.2, gamma=0.99, lam=
 
     # 遍历所有节点获取 rewards 和 value
     for node in traverse_tree(root_node):
-        # _, predicted_value = model.predict(node.state)
+        if node == root_node:
+            continue
         rewards.append(
             node.true_value_from_tree
             if node.true_value_from_tree != None
             else node.value
-        )  # 假设 true_value 存储真实的奖励
-        values.append(node.value)
+        )
+        values.append(node.original_value)
+
+        print(node.value,node.true_value_from_tree, node.original_value)
 
     # 计算 GAE
     advantages = compute_gae(rewards, values, gamma, lam)
-    # print(f"Advantages: {advantages}")
 
     # 遍历节点以应用 PPO 和 GAE
-    for node, advantage in zip(traverse_tree(root_node), advantages):
-        # 获取当前策略和价值估计
-        predicted_policy, predicted_value = training_time_predict(node)
-
-        # # 目标策略 (MCTS结果)
-        # actual_policy = {child: child.visits / node.visits for child in node.children if node.visits > 0}
-        # target_policy_probs = torch.tensor([actual_policy.get(child, 0) for child in node.children], dtype=torch.float32)
-
-        if len(node.children) > 0 and node.rectify_visits > 0:
-            # 旧策略：从节点缓存中获取，计算旧策略的概率
-            old_policy_probs = torch.tensor(
-                [node.policy[child] for child in node.children], dtype=torch.float32
-            ).softmax(dim=0)
-
-            # PPO 策略损失 (使用 GAE)
+    for node, advantage in tqdm(zip(traverse_tree(root_node), advantages)):
+        if node == root_node:
+            continue
+        if len(node.children) > 0:
+            # old_policy_probs = torch.tensor(
+            #     [node.policy[child] for child in node.children], dtype=torch.float32
+            # ).softmax(dim=0)
+            with torch.no_grad():
+                old_policy_probs = torch.tensor(
+                    [
+                        training_time_policy_predict(child, model.get_base_model())[0]
+                        for child in node.children
+                    ],
+                    dtype=torch.float32,
+                ).softmax(dim=0)
             new_policy_probs = torch.tensor(
-                [predicted_policy[child.index] for child in node.children],
+                [
+                    training_time_policy_predict(child, model)[0]
+                    for child in node.children
+                ],
                 dtype=torch.float32,
             ).softmax(dim=0)
 
-            ppo_loss_0 = ppo_loss(
+            policy_loss = ppo_loss(
                 old_policy_probs, new_policy_probs, torch.tensor(advantage), epsilon
             )
-            # print(f"PPO Loss: {ppo_loss_0}")
-            policy_loss += ppo_loss_0
 
-        # 价值损失
-        true_value = (
-            node.true_value_from_tree
-            if node.true_value_from_tree != None
-            else node.value
-        )
-        true_value_one_hot = torch.tensor(
-            [1 if true_value >= 0 else 0],
-            dtype=torch.long,device=predicted_value.device
-        )
-        value_loss += criterion_value(predicted_value.softmax(dim=0), true_value_one_hot)
+            predicted_value_logit = training_time_value_predict(node).squeeze(0)
+            positive_rating_log_prob = (
+                node.true_value_from_tree
+                if node.true_value_from_tree != None
+                else node.value
+            )
+            positive_rating_log_prob = torch.tensor(
+                [positive_rating_log_prob], dtype=torch.float32
+            )
+            clamp_positive_rating_prob = torch.exp(torch.clamp(
+                positive_rating_log_prob, math.log(1e-6), 0
+            ))
+            clamp_negative_rating_prob = 1 - clamp_positive_rating_prob
+            target_probs = torch.tensor(
+                [clamp_positive_rating_prob, clamp_negative_rating_prob],
+                dtype=torch.float32,
+            )
+            print(predicted_value_logit, target_probs)
+            value_loss = F.binary_cross_entropy_with_logits(
+                predicted_value_logit, target_probs.to(accelerator.device)
+            )
+            # true_value_one_hot = torch.tensor(
+            #     [1 if np.exp(positive_rating_log_prob) >= 0.5 else 0],
+            #     dtype=torch.long, device=predicted_value_logit.device
+            # )
+            # value_loss += criterion_value(predicted_value_logit.softmax(dim=0), true_value_one_hot)
 
-        # # L2 正则化损失
-        # for param in model.parameters():
-        #     regularization_loss += torch.norm(param) ** 2
+            # 每处理完一个节点后检查是否达到累积步骤
+            step_count += 1
+            total_loss = (policy_loss + value_loss) / accumulation_steps
+            print(policy_loss.item(), value_loss.item(), total_loss.item())
+            total_loss.backward()
+            if step_count % accumulation_steps == 0:
+                # 累积足够的梯度后，进行一次参数更新
+                optimizer.step()
+                optimizer.zero_grad()
+            policy_loss_list.append(policy_loss.item())
+            value_loss_list.append(value_loss.item())
+            total_loss_list.append(total_loss.item())
+            policy_loss = 0
+            value_loss = 0
+            total_loss = 0
 
-    # 总损失
-    total_loss = policy_loss + value_loss
-    print(f"Total Loss: {total_loss}, Policy Loss: {policy_loss}, Value Loss: {value_loss}")
-    total_loss.backward()
-    optimizer.step()
+    # 确保所有梯度都被处理，处理不完整批次的梯度
+    if step_count % accumulation_steps != 0 and step_count > 0:
+        optimizer.step()
+        optimizer.zero_grad()
 
-    return total_loss.item()
+    return np.mean(policy_loss_list), np.mean(value_loss_list), np.mean(total_loss_list)
 
 
 # Self-play and Training Loop
@@ -734,7 +1113,7 @@ class AlphaGoZeroForMath:
 
 # Running Training
 initial_state = problem_declaration_template(
-    "Natalia sold clips to 48 of her friends in April, and then she sold half as many clips in May. How many clips did Natalia sell altogether in April and May?"
+    "There are several chickens and rabbits in a cage. Counting from the top, there are 35 heads and counting from the bottom, there are 94 feet. How many chickens are there?"
 )
 agent = AlphaGoZeroForMath(model, tokenizer)
 agent.train(num_iterations=10, initial_state=initial_state)
