@@ -4,14 +4,14 @@
 TBD
 
 ## Pretraining
-(OpenLongCoT Dataset)[https://huggingface.co/datasets/qq8933/OpenLongCoT-Pretrain]
+[OpenLongCoT Dataset](https://huggingface.co/datasets/qq8933/OpenLongCoT-Pretrain)
 
 TBD: Pretrain Code, recommend using LLaMaFactory for now.
 ## RLSP Training
 
 ### Recommend Base LongCoT Model for experiments
 
-(Gemma2-2B-OpenLongCoT)[https://huggingface.co/qq8933/OpenLongCoT-Base-Gemma2-2B]
+[Gemma2-2B-OpenLongCoT](https://huggingface.co/qq8933/OpenLongCoT-Base-Gemma2-2B)
 
 ### Install
 Setup Envoirments,
