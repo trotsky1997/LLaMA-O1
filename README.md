@@ -1,5 +1,5 @@
-# Tiny-O1: Open Large Reasoning Models Framework For Training, Inference and Evaluation With PyTorch and HuggingFace
-
+# LLaMA-O1: Open Large Reasoning Model Frameworks For Training, Inference and Evaluation With PyTorch and HuggingFace
+![alt text](image.png)
 ## Tutorials
 TBD
 
