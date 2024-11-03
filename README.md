@@ -2,7 +2,8 @@
 
 ## Pretraining
 (OpenLongCoT Dataset)[https://huggingface.co/datasets/qq8933/OpenLongCoT-Pretrain]
-TBD: Pretrain Code
+
+TBD: Pretrain Code, recommend using LLaMaFactory for now.
 ## RLSP Training
 
 ### Recommend Base LongCoT Model for experiments
@@ -60,4 +61,10 @@ Please Please cite me if this repo is helpful for you!🥰
 ```
 ## License
 This Repository was distributed under the License of MIT.
+
 PS: Please reserve author information and citations in re-developments.
+
+## Contact
+```
+di.zhang@ustc.edu
+```
