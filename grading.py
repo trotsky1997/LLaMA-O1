@@ -404,30 +404,3 @@ def check(gt,ans,DATA_NAME):
     # print(gt_label,ans_label)
     # print(type)
     return check_label(gt_label,ans_label)
-
-# def check(gt,ans,DATA_NAME):
-
-#     a = our_check(gt,ans,DATA_NAME) 
-#     b = openai_is_equiv(ans,gt)
-#     if a != b:
-#         print(gt,ans)
-#         print(a,b)
-#         raise Exception('Check function is not working properly')
-#     return a and b
-    
-def get_ans_format(ground_truth,DATA_NAME):
-    if 'gsm' in DATA_NAME:
-        ans_format = r'"\n#### Final Answer \n The answer is [answer] \n#### [answer]"'
-    else:
-        # print(ground_truth)
-        label = extract_label(ground_truth,DATA_NAME)
-        # print('***',label)
-        if label.isdigit():
-            ans_format = r'"\n#### Final Answer\n The answer is [number] \n#### [number]"'
-        elif label.isalpha() and extract_label(ground_truth,DATA_NAME).isupper():
-            ans_format = r'"\n#### Final Answer \n The answer is \\boxed{[option]} \n#### [option]"'
-        elif label.lower() in ['yes','no']:
-            ans_format = r'"\n#### Final Answer \n The answer is \\boxed{[Yes or No]} \n#### [Yes or No]"'
-        else:
-            ans_format = r'"\n#### Final Answer \n The answer is \\boxed{[answer formula]} \n#### [answer formula]"'
-    return ans_format
