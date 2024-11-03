@@ -21,15 +21,15 @@ pip install torch transformers accelerate peft datasets
 ```
 Pull codes,
 ```
-git clone https://github.com/SimpleBerry/Tiny-O1
-cd Tiny-O1
+git clone https://github.com/SimpleBerry/LLaMA-O1
+cd LLaMA-O1
 git pull
 ```
 
 ### Training
 Run training,
 ```
-# cd Tiny-O1
+# cd LLaMA-O1
 python main.py
 ```
 Or run with Accelerate,
