@@ -1,5 +1,5 @@
 # LLaMA-O1: Open Large Reasoning Model Frameworks For Training, Inference and Evaluation With PyTorch and HuggingFace
-![alt text](image.png)
+![alt text](image-1.png)
 ## Tutorials
 TBD
 
