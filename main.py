@@ -720,7 +720,7 @@ class PrioritizedReplayBuffer:
                 self.priorities = priorities_array.tolist()
 
 
-class AlphaGoZeroForMath(Trainer):
+class RLSPTrainer(Trainer):
     def __init__(self, envoirment, model, tokenizer, mcts, replay_buffer_capacity=100000, **kwargs):
         super().__init__(
             model=model,
@@ -997,7 +997,7 @@ class Environment:
 from transformers import AutoModelForCausalLM, AutoTokenizer, AdamW
 import torch
 
-# 假设您已经定义了 TreeNode、MCTS 和 AlphaGoZeroForMath 类
+# 假设您已经定义了 TreeNode、MCTS 和 RLSPTrainer 类
 
 # 加载模型和 tokenizer
 model_name = "/mnt/hwfile/ai4chem/CKPT/longcot_pt_GEMMA_ZD_10_23_1"
@@ -1056,8 +1056,8 @@ mcts = MCTS(
     reward_epsilon=reward_epsilon
 )
 
-# 创建 AlphaGoZeroForMath 实例
-trainer = AlphaGoZeroForMath(
+# 创建 RLSPTrainer 实例
+trainer = RLSPTrainer(
     envoirment=envoirment,
     model=model,
     tokenizer=tokenizer,
